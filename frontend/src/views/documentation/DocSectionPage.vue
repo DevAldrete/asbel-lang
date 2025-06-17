@@ -5,7 +5,7 @@
 </template>
 
 <script setup>
-import { ref, watch, defineProps, shallowRef } from 'vue';
+import { ref, watch, shallowRef } from 'vue';
 import { useRoute } from 'vue-router';
 
 const props = defineProps({
@@ -38,7 +38,7 @@ const loadDocComponent = async () => {
     } catch (e) {
       console.error(`Failed to load documentation component for section: ${sectionPath}`, e);
       // Optionally, load a 'NotFound' or 'ContentComingSoon' component
-      const fallback = await import('../../NotFoundPage.vue'); // Or a specific DocNotFound.vue
+      const fallback = await import('../NotFoundPage.vue'); // Or a specific DocNotFound.vue
       currentDocComponent.value = fallback.default;
     }
   } else {
@@ -48,7 +48,7 @@ const loadDocComponent = async () => {
         const component = await import(`./content/IntroductionDoc.vue`); // Default to introduction
         currentDocComponent.value = component.default;
     } catch (e) {
-        const fallback = await import('../../NotFoundPage.vue');
+        const fallback = await import('../NotFoundPage.vue');
         currentDocComponent.value = fallback.default;
     }
   }
