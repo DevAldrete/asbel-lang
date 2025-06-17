@@ -1,0 +1,1 @@
+<template><div class="p-4"><h1 class="text-3xl font-bold text-gray-800">ASBEL Development Roadmap</h1><p class="mt-2 text-lg text-gray-600">Roadmap details coming soon!</p></div></template><script setup></script>
