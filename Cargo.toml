@@ -1,0 +1,15 @@
+[workspace]
+members = [
+    "compiler",
+    "cli"
+]
+resolver = "2"
+
+# Optional: Default members to run with `cargo run` without `-p <package>`
+# default-members = ["cli"] # If you want `cargo run` to default to the CLI
+
+# Optional: Define a virtual manifest if the root doesn't have its own package
+# [package]
+# name = "asbel-project-root" # Or any other suitable name
+# version = "0.1.0"
+# edition = "2021"
