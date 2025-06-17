@@ -1,0 +1,7 @@
+[package]
+name = "asbel-compiler"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+
+[dependencies]
