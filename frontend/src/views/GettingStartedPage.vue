@@ -1,0 +1,1 @@
+<template><div class="p-4"><h1 class="text-3xl font-bold text-gray-800">Getting Started with ASBEL</h1><p class="mt-2 text-lg text-gray-600">Installation and setup guide coming soon!</p></div></template><script setup></script>
