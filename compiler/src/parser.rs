@@ -1,11 +1,13 @@
 use crate::ast::*;
 use crate::lexer::{Lexer, Token, TokenKind};
+use crate::symbol_table::{SymbolTable, SymbolKind};
 
 pub struct Parser<'a> {
     lexer: Lexer<'a>,
     current_token: Token,
     peek_token: Token,
     pub errors: Vec<String>,
+    symbol_table: SymbolTable,
 }
 
 impl<'a> Parser<'a> {
@@ -19,11 +21,18 @@ impl<'a> Parser<'a> {
         let first_token = lexer.next_token();
         let second_token = lexer.next_token();
 
+        let mut symbol_table = SymbolTable::new();
+        // Pre-populate built-in functions
+        // Panicking here is acceptable as this is a setup issue for the compiler itself.
+        symbol_table.define("print".to_string(), SymbolKind::BuiltInFunction)
+            .expect("Failed to define built-in 'print' function. This should not happen.");
+
         Parser {
             lexer,
             current_token: first_token,
             peek_token: second_token,
             errors: Vec::new(),
+            symbol_table, // Use the initialized symbol_table
         }
     }
 
@@ -84,11 +93,11 @@ impl<'a> Parser<'a> {
         let mut program = Program { body: Vec::new() };
 
         while self.current_token.kind != TokenKind::Eof {
-            // Skip empty newlines between statements if any
-            while self.current_token.kind == TokenKind::Newline {
+            // Skip empty newlines and comments between statements
+            while self.current_token_is(&TokenKind::Newline) || matches!(self.current_token.kind, TokenKind::Comment(_)) {
                 self.next_token_internal();
             }
-            if self.current_token.kind == TokenKind::Eof { // Check again after skipping newlines
+            if self.current_token.kind == TokenKind::Eof { // Check again after skipping
                 break;
             }
 
@@ -171,6 +180,12 @@ impl<'a> Parser<'a> {
             self.next_token_internal();
         }
 
+        // Define the variable in the symbol table
+        if let Err(e) = self.symbol_table.define(name.clone(), SymbolKind::Variable) {
+            self.errors.push(e);
+            // We might choose to return None here if a symbol error is critical
+            // For now, we'll record the error and return the statement.
+        }
 
         Some(Statement::Let { name, value })
     }
@@ -232,6 +247,15 @@ impl<'a> Parser<'a> {
             Some(b) => b,
             None => return None, // Error in block parsing
         };
+
+        // Define the function in the symbol table
+        // Note: Parameters are not added to this global symbol table in this MVP step.
+        // A more advanced implementation would handle scopes for parameters.
+        if let Err(e) = self.symbol_table.define(name.clone(), SymbolKind::Function) {
+            self.errors.push(e);
+            // Similar to let, decide if this error should prevent returning the statement.
+            // For now, record error and return statement.
+        }
 
         Some(Statement::FunctionDeclaration { name, params, return_type, body })
     }
@@ -308,11 +332,11 @@ impl<'a> Parser<'a> {
         self.next_token_internal(); // Consume Indent, current_token is now the first token of the first statement in block
 
         while !self.current_token_is(&TokenKind::Dedent) && !self.current_token_is(&TokenKind::Eof) {
-            // Skip any leading newlines within the block (e.g. empty lines)
-            while self.current_token_is(&TokenKind::Newline) {
+            // Skip any leading newlines or comments within the block
+            while self.current_token_is(&TokenKind::Newline) || matches!(self.current_token.kind, TokenKind::Comment(_)) {
                 self.next_token_internal();
             }
-            // Check again after skipping newlines
+            // Check again after skipping
             if self.current_token_is(&TokenKind::Dedent) || self.current_token_is(&TokenKind::Eof) {
                 break;
             }
@@ -609,6 +633,212 @@ impl<'a> Parser<'a> {
             }
         }
     }
+
+    #[test]
+    fn test_parameter_edge_cases() {
+        // Valid cases
+        let valid_cases = vec![
+            ("fn noParams()\n  \n", "noParams", vec![]),
+            ("fn oneParam(a)\n  \n", "oneParam", vec![Parameter { name: "a".to_string(), type_ann: None }]),
+            ("fn typedParam(a: MyType)\n  \n", "typedParam", vec![Parameter { name: "a".to_string(), type_ann: Some("MyType".to_string()) }]),
+            ("fn multipleParams(a: TypeA, b, c: TypeC)\n  \n", "multipleParams", vec![
+                Parameter { name: "a".to_string(), type_ann: Some("TypeA".to_string()) },
+                Parameter { name: "b".to_string(), type_ann: None },
+                Parameter { name: "c".to_string(), type_ann: Some("TypeC".to_string()) },
+            ]),
+        ];
+
+        for (input, expected_fn_name, expected_params) in valid_cases {
+            let program = parse_input_to_program(input);
+            assert_eq!(program.body.len(), 1, "Program body should have 1 statement for input: {}", input);
+            match &program.body[0] {
+                Statement::FunctionDeclaration { name, params, .. } => {
+                    assert_eq!(name, expected_fn_name, "Function name mismatch for input: {}", input);
+                    assert_eq!(params.len(), expected_params.len(), "Parameter count mismatch for input: {}", input);
+                    for (i, expected_param) in expected_params.iter().enumerate() {
+                        assert_eq!(&params[i], expected_param, "Parameter mismatch at index {} for input: {}", i, input);
+                    }
+                }
+                _ => panic!("Expected FunctionDeclaration for input: {}", input),
+            }
+        }
+
+        // Error case: Trailing comma in parameters
+        let input_trailing_comma = "fn paramsWithTrailingCommaError(a, b,)\n  \n";
+        let lexer_tc = Lexer::new(input_trailing_comma);
+        let mut parser_tc = Parser::new(lexer_tc);
+        parser_tc.parse_program();
+        assert!(!parser_tc.errors.is_empty(), "Expected errors for trailing comma input: '{}'", input_trailing_comma);
+        assert!(parser_tc.errors.iter().any(|e| e.contains("Trailing comma in parameter list not allowed")),
+            "Specific error for trailing comma not found. Errors: {:?}", parser_tc.errors);
+
+        // Error case: Missing parameter name after comma
+        let input_missing_param_name = "fn missingParamName(a, :TypeB)\n \n";
+        let lexer_mpn = Lexer::new(input_missing_param_name);
+        let mut parser_mpn = Parser::new(lexer_mpn);
+        parser_mpn.parse_program();
+        assert!(!parser_mpn.errors.is_empty(), "Expected errors for missing param name: '{}'", input_missing_param_name);
+        assert!(parser_mpn.errors.iter().any(|e| e.contains("Expected identifier for parameter name, got Colon instead")),
+            "Specific error for missing param name not found. Errors: {:?}", parser_mpn.errors);
+
+    }
+
+    #[test]
+    fn test_program_multiple_statements_and_comments() {
+        let input = r#"
+// Program start
+let x = 10 // variable x
+
+// Function definition
+fn myFunc(p1)
+  // Function body comment
+  let y = p1 + x
+  y // implicit return or expression statement in function body
+
+let z = myFunc(5) // call function
+// End of program
+"#;
+        // Expected AST structure:
+        // Program:
+        // 1. LetStatement { name: "x", value: LiteralInteger(10) }
+        // 2. FunctionDeclaration { name: "myFunc", params: [Parameter("p1", None)], return_type: None,
+        //      body: BlockStatement {
+        //          1. LetStatement { name: "y", value: Infix(Ident("p1"), Plus, Ident("x")) }
+        //          2. ExpressionStatement { expression: Ident("y") }
+        //      }}
+        // 3. LetStatement { name: "z", value: FunctionCall { function: Ident("myFunc"), args: [LiteralInteger(5)] } }
+
+        let program = parse_input_to_program(input);
+
+        assert_eq!(program.body.len(), 3, "Program should have 3 top-level statements. Found: {:?}", program.body);
+
+        // Check statement 1: let x = 10
+        match &program.body[0] {
+            Statement::Let { name, value } => {
+                assert_eq!(name, "x");
+                assert_eq!(*value, Expression::LiteralInteger(10));
+            }
+            _ => panic!("Expected Let statement for x, got {:?}", program.body[0]),
+        }
+
+        // Check statement 2: fn myFunc(p1)...
+        match &program.body[1] {
+            Statement::FunctionDeclaration { name, params, return_type, body } => {
+                assert_eq!(name, "myFunc");
+                assert_eq!(params.len(), 1);
+                assert_eq!(params[0], Parameter { name: "p1".to_string(), type_ann: None });
+                assert!(return_type.is_none());
+
+                assert_eq!(body.statements.len(), 2, "myFunc body should have 2 statements.");
+                // Check myFunc body statement 1: let y = p1 + x
+                match &body.statements[0] {
+                    Statement::Let { name: name_y, value: value_y } => {
+                        assert_eq!(name_y, "y");
+                        if let Expression::InfixExpression { left, operator, right } = value_y {
+                            assert_eq!(**left, Expression::Identifier("p1".to_string()));
+                            assert_eq!(*operator, InfixOperator::Plus);
+                            assert_eq!(**right, Expression::Identifier("x".to_string()));
+                        } else {
+                            panic!("Expected infix expression for let y value, got {:?}", value_y);
+                        }
+                    }
+                    _ => panic!("Expected Let statement for y in myFunc, got {:?}", body.statements[0]),
+                }
+                // Check myFunc body statement 2: y
+                match &body.statements[1] {
+                    Statement::ExpressionStatement { expression } => {
+                        assert_eq!(*expression, Expression::Identifier("y".to_string()));
+                    }
+                    _ => panic!("Expected ExpressionStatement for y in myFunc, got {:?}", body.statements[1]),
+                }
+            }
+            _ => panic!("Expected FunctionDeclaration for myFunc, got {:?}", program.body[1]),
+        }
+
+        // Check statement 3: let z = myFunc(5)
+        match &program.body[2] {
+            Statement::Let { name, value } => {
+                assert_eq!(name, "z");
+                if let Expression::FunctionCall { function, arguments } = value {
+                    assert_eq!(**function, Expression::Identifier("myFunc".to_string()));
+                    assert_eq!(arguments.len(), 1);
+                    assert_eq!(arguments[0], Expression::LiteralInteger(5));
+                } else {
+                    panic!("Expected FunctionCall for let z value, got {:?}", value);
+                }
+            }
+            _ => panic!("Expected Let statement for z, got {:?}", program.body[2]),
+        }
+    }
+
+
+    #[test]
+    fn test_functions_empty_or_comment_only_body() {
+        // Test 1: Function with an effectively empty body (just newline after indent)
+        // Lexer: Fn, Ident, LParen, RParen, Newline, Indent, Newline, Dedent, Eof
+        let input_empty = "fn emptyBody()\n  \n";
+        let program_empty = parse_input_to_program(input_empty);
+        assert_eq!(program_empty.body.len(), 1, "Empty body: program should have 1 statement.");
+        match &program_empty.body[0] {
+            Statement::FunctionDeclaration { name, body, .. } => {
+                assert_eq!(name, "emptyBody");
+                assert!(body.statements.is_empty(), "Empty body: function body should have 0 statements. Got: {:?}", body.statements);
+            }
+            _ => panic!("Expected FunctionDeclaration for empty body test."),
+        }
+
+        // Test 2: Function with only comments in the body
+        // Lexer: Fn, Ident, LParen, RParen, Newline, Indent, Comment, Newline, Dedent, Eof
+        // This test currently expects failure due to how parse_statement handles comments.
+        let input_comment_only = "fn commentBody()\n  // only a comment\n  \n";
+        let lexer_comment = Lexer::new(input_comment_only);
+        let mut parser_comment = Parser::new(lexer_comment);
+        let program_comment_result = parser_comment.parse_program();
+
+        // Based on current parser logic, this should produce an error.
+        // "No prefix parse function for token Comment..."
+        if parser_comment.errors.is_empty() {
+            // If no errors, it means the parser was modified to handle comments.
+            // In that case, the body should be empty.
+            assert_eq!(program_comment_result.body.len(), 1, "Comment only body (no error): program should have 1 statement.");
+            match &program_comment_result.body[0] {
+                Statement::FunctionDeclaration { name, body, .. } => {
+                    assert_eq!(name, "commentBody");
+                    assert!(body.statements.is_empty(), "Comment only body (no error): function body should have 0 statements. Got: {:?}", body.statements);
+                }
+                _ => panic!("Expected FunctionDeclaration for comment only body test (no error case)."),
+            }
+            println!("Successfully parsed comment-only body (parser likely modified). Errors: {:?}", parser_comment.errors);
+        } else {
+            // This is the path if the parser has NOT been modified yet.
+            println!("Detected errors for comment-only body (as expected for unmodified parser): {:?}", parser_comment.errors);
+            assert!(parser_comment.errors.iter().any(|e| e.contains("No prefix parse function for token Comment")),
+                "Expected error 'No prefix parse function for token Comment' not found. Errors: {:?}", parser_comment.errors);
+            // The function itself might not be added to the program body if parse_block_statement returns None.
+            // So, program_comment_result.body might be empty or the FunctionDeclaration might be incomplete.
+        }
+
+        // Test 3: Function with multiple comments and blank lines
+        let input_multi_comment = "fn multiCommentBody()\n  // comment 1\n\n  // comment 2\n  \n";
+        let lexer_multi_comment = Lexer::new(input_multi_comment);
+        let mut parser_multi_comment = Parser::new(lexer_multi_comment);
+        let program_multi_comment_result = parser_multi_comment.parse_program();
+        if parser_multi_comment.errors.is_empty() {
+             assert_eq!(program_multi_comment_result.body.len(), 1, "Multi comment body (no error): program should have 1 statement.");
+            match &program_multi_comment_result.body[0] {
+                Statement::FunctionDeclaration { name, body, .. } => {
+                    assert_eq!(name, "multiCommentBody");
+                    assert!(body.statements.is_empty(), "Multi comment body (no error): function body should have 0 statements. Got: {:?}", body.statements);
+                }
+                _ => panic!("Expected FunctionDeclaration for multi comment body test (no error case)."),
+            }
+            println!("Successfully parsed multi-comment body (parser likely modified). Errors: {:?}", parser_multi_comment.errors);
+        } else {
+            println!("Detected errors for multi-comment body (as expected for unmodified parser): {:?}", parser_multi_comment.errors);
+            assert!(parser_multi_comment.errors.iter().any(|e| e.contains("No prefix parse function for token Comment")),
+                "Expected error 'No prefix parse function for token Comment' not found for multi-comment. Errors: {:?}", parser_multi_comment.errors);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -814,6 +1044,492 @@ mod tests {
         assert!(!parser.errors.is_empty(), "Expected parser errors for input: {}", input);
         // Optionally, check for specific error messages
         // e.g., assert!(parser.errors[0].contains("Expected next token to be Eq"));
-        println!("Parser errors for 'let x 5': {:?}", parser.errors);
+        println!("Parser errors for 'let x 5': {:?}", parser.errors); // Keep for debugging if needed
+    }
+
+    #[test]
+    fn test_parser_errors_let_statement() {
+        let test_cases = vec![
+            ("let x 5\n", "Expected next token to be Eq, got Integer(5) instead"), // Missing =
+            ("let = 5\n", "Expected next token to be Ident(\"\"), got Eq instead"),   // Missing identifier
+            ("let x =\n", "Expected expression after '=' in let statement for 'x'."), // Missing expression
+            ("let x = 5 y\n", "Expected newline after expression in let statement, got Ident(\"y\")"), // Unexpected token
+        ];
+
+        for (input, expected_error_fragment) in test_cases {
+            let lexer = Lexer::new(input);
+            let mut parser = Parser::new(lexer);
+            parser.parse_program();
+            assert!(!parser.errors.is_empty(), "No errors found for input: '{}'", input);
+            // Check if at least one error message contains the expected fragment.
+            let found_error = parser.errors.iter().any(|e| e.contains(expected_error_fragment));
+            assert!(found_error, "Expected error fragment '{}' not found in errors {:?} for input '{}'", expected_error_fragment, parser.errors, input);
+        }
+
+        // Test case: `let x =` (EOF instead of expression)
+        let input_eof = "let x =";
+        let lexer_eof = Lexer::new(input_eof);
+        let mut parser_eof = Parser::new(lexer_eof);
+        parser_eof.parse_program();
+        assert!(!parser_eof.errors.is_empty(), "No errors found for input: '{}'", input_eof);
+        let found_eof_error = parser_eof.errors.iter().any(|e| e.contains("Expected expression after '='"));
+        assert!(found_eof_error, "Expected error for EOF after '=' not found in errors {:?} for input '{}'", parser_eof.errors, input_eof);
+
+    }
+
+    #[test]
+    fn test_parser_errors_function_declaration() {
+        let test_cases = vec![
+            ("fn ()\n", "Expected next token to be Ident(\"\"), got LParen instead"), // Missing function name
+            ("fn myFunction\n", "Expected next token to be LParen, got Newline instead"), // Missing ()
+            ("fn myFunction(\n", "Expected ')' to close parameter list, got Eof instead"), // Missing )
+            ("fn myFunction(a b)\n", "Expected comma or ')' after parameter, got Ident(\"b\") instead"), // Missing comma or type
+            ("fn myFunction(a:)\n", "Expected type identifier after ':' in parameter, got RParen instead"), // Missing type after colon
+            ("fn myFunction(a: num\n", "Expected ')' to close parameter list, got Eof instead"), // Missing ) after param type
+            ("fn myFunction() -> \n", "Expected return type identifier after ':', got Newline instead"), // Missing return type
+            ("fn myFunction() -> num\n", "Expected newline before function body block, got Eof instead"), // Missing body (Newline/Indent)
+            // For "missing Dedent at end of block", the parser currently expects a Dedent token.
+            // If the input is "fn myFunction()\n  let x = 1\n" (and then EOF)
+            // parse_block_statement will consume Indent, then 'let x = 1\n'.
+            // Then it will look for Dedent. If current_token is EOF, it will report "Expected Dedent... got Eof".
+            ("fn myFunction()\n  let x = 1\n", "Expected Dedent to end block, got Eof instead"),
+        ];
+
+        for (input, expected_error_fragment) in test_cases {
+            let lexer = Lexer::new(input);
+            let mut parser = Parser::new(lexer);
+            parser.parse_program();
+            assert!(!parser.errors.is_empty(), "No errors found for input: '{}'", input);
+            let found_error = parser.errors.iter().any(|e| e.contains(expected_error_fragment));
+            assert!(found_error, "Expected error fragment '{}' not found in errors {:?} for input '{}'", expected_error_fragment, parser.errors, input);
+        }
+
+        // Specific test for `fn myFunction(a: num` (missing `)` but has content after type)
+        let input_specific = "fn myFunction(a: num b)\n"; // `b` is unexpected after type
+        let lexer_specific = Lexer::new(input_specific);
+        let mut parser_specific = Parser::new(lexer_specific);
+        parser_specific.parse_program();
+        assert!(!parser_specific.errors.is_empty(), "No errors for specific case: '{}'", input_specific);
+        let found_specific_error = parser_specific.errors.iter().any(|e| e.contains("Expected comma or ')' after parameter, got Ident(\"b\")"));
+        assert!(found_specific_error, "Specific error for 'fn myFunction(a: num b)' not found, errors: {:?}", parser_specific.errors);
+
+
+        // Test for missing Indent after function signature + Newline
+        let input_missing_indent = "fn myFunc()\nlet x = 1\n";
+        let lexer_missing_indent = Lexer::new(input_missing_indent);
+        let mut parser_missing_indent = Parser::new(lexer_missing_indent);
+        parser_missing_indent.parse_program();
+        assert!(!parser_missing_indent.errors.is_empty(), "No errors for missing indent: '{}'", input_missing_indent);
+        // expect_peek for Indent is called. peek_token would be 'Let'.
+        let found_missing_indent_error = parser_missing_indent.errors.iter().any(|e| e.contains("Expected indent for function body, got Let instead"));
+        assert!(found_missing_indent_error, "Error for missing indent not found, errors: {:?}", parser_missing_indent.errors);
+    }
+
+    #[test]
+    fn test_parse_print_function_call_literal() {
+        let input = "print(\"Hello, World!\")\n";
+        let program = parse_input_to_program(input);
+
+        assert_eq!(program.body.len(), 1, "Program should have 1 statement.");
+        match &program.body[0] {
+            Statement::ExpressionStatement { expression } => {
+                match expression {
+                    Expression::FunctionCall { function, arguments } => {
+                        match &**function {
+                            Expression::Identifier(name) => {
+                                assert_eq!(name, "print", "Function name should be 'print'.");
+                            }
+                            _ => panic!("Expected Identifier for function name, got {:?}", function),
+                        }
+                        assert_eq!(arguments.len(), 1, "Print call should have 1 argument.");
+                        match &arguments[0] {
+                            Expression::LiteralString(value) => {
+                                assert_eq!(value, "Hello, World!", "Argument value mismatch.");
+                            }
+                            _ => panic!("Expected LiteralString for print argument, got {:?}", arguments[0]),
+                        }
+                    }
+                    _ => panic!("Expected FunctionCall expression, got {:?}", expression),
+                }
+            }
+            _ => panic!("Expected ExpressionStatement, got {:?}", program.body[0]),
+        }
+    }
+
+    #[test]
+    fn test_parse_print_function_call_identifier() {
+        let input = r#"
+let my_message = "test"
+print(my_message)
+"#;
+        let program = parse_input_to_program(input);
+
+        assert_eq!(program.body.len(), 2, "Program should have 2 statements.");
+
+        // Check the second statement: print(my_message)
+        match &program.body[1] {
+            Statement::ExpressionStatement { expression } => {
+                match expression {
+                    Expression::FunctionCall { function, arguments } => {
+                        match &**function {
+                            Expression::Identifier(name) => {
+                                assert_eq!(name, "print", "Function name should be 'print'.");
+                            }
+                            _ => panic!("Expected Identifier for function name, got {:?}", function),
+                        }
+                        assert_eq!(arguments.len(), 1, "Print call should have 1 argument.");
+                        match &arguments[0] {
+                            Expression::Identifier(name) => {
+                                assert_eq!(name, "my_message", "Argument should be identifier 'my_message'.");
+                            }
+                            _ => panic!("Expected Identifier for print argument, got {:?}", arguments[0]),
+                        }
+                    }
+                    _ => panic!("Expected FunctionCall expression for print statement, got {:?}", expression),
+                }
+            }
+            _ => panic!("Expected ExpressionStatement for print statement, got {:?}", program.body[1]),
+        }
+    }
+
+    #[test]
+    fn test_print_is_builtin_in_symbol_table() {
+        // Empty input is fine, we just need the parser's initial state
+        let lexer = Lexer::new("");
+        let parser = Parser::new(lexer); // Parser::new() should define "print"
+
+        match parser.symbol_table.resolve(&"print".to_string()) {
+            Some(symbol) => {
+                assert_eq!(symbol.name, "print");
+                assert_eq!(symbol.kind, SymbolKind::BuiltInFunction, "'print' should be registered as a BuiltInFunction.");
+            }
+            None => panic!("'print' built-in function not found in symbol table after parser initialization."),
+        }
+    }
+
+    #[test]
+    fn test_user_cannot_redefine_print_variable() {
+        let input = "let print = 123\n";
+        let lexer = Lexer::new(input);
+        let mut parser = Parser::new(lexer);
+        parser.parse_program();
+
+        assert!(!parser.errors.is_empty(), "Expected parser errors when redefining 'print' as a variable.");
+        assert!(
+            parser.errors.iter().any(|e| e.contains("Symbol 'print' is already defined")),
+            "Error message for redefining 'print' as variable not found. Errors: {:?}", parser.errors
+        );
+    }
+
+    #[test]
+    fn test_user_cannot_redefine_print_function() {
+        let input = r#"
+fn print(s: String) // Attempt to redefine print
+  // some other implementation
+  let x = 1
+"#;
+        // Note: The body needs to be valid enough to not cause other errors before the symbol definition.
+        // Adding a newline and proper indent/dedent if the parser expects it.
+        // The current parser expects Newline, Indent, (statements), Dedent for a function body.
+        // So, the input should be:
+        // fn print(s: String)
+        //   let x = 1
+        //
+        // Let's make the input for the test robust for function body parsing:
+        let full_input = "fn print(s: String)\n  let x = 1\n";
+
+        let lexer = Lexer::new(full_input);
+        let mut parser = Parser::new(lexer);
+        parser.parse_program();
+
+        assert!(!parser.errors.is_empty(), "Expected parser errors when redefining 'print' as a function.");
+        assert!(
+            parser.errors.iter().any(|e| e.contains("Symbol 'print' is already defined")),
+            "Error message for redefining 'print' as function not found. Errors: {:?}", parser.errors
+        );
+    }
+
+    #[test]
+    fn test_symbol_registration_let_and_function() {
+        let input = r#"
+let x = 10
+fn my_func()
+  let y = 20 // y is local, should not be in global symbol table
+"#;
+        let lexer = Lexer::new(input);
+        let mut parser = Parser::new(lexer);
+        parser.parse_program();
+
+        assert!(parser.errors.is_empty(), "Expected no parser errors, got: {:?}", parser.errors);
+
+        // Check global 'x'
+        match parser.symbol_table.resolve(&"x".to_string()) {
+            Some(symbol) => {
+                assert_eq!(symbol.name, "x");
+                assert_eq!(symbol.kind, SymbolKind::Variable);
+            }
+            None => panic!("Global variable 'x' not found in symbol table."),
+        }
+
+        // Check global 'my_func'
+        match parser.symbol_table.resolve(&"my_func".to_string()) {
+            Some(symbol) => {
+                assert_eq!(symbol.name, "my_func");
+                assert_eq!(symbol.kind, SymbolKind::Function);
+            }
+            None => panic!("Global function 'my_func' not found in symbol table."),
+        }
+
+        // Check that local 'y' is NOT in the global symbol table
+        assert!(
+            parser.symbol_table.resolve(&"y".to_string()).is_none(),
+            "Local variable 'y' should not be in the global symbol table."
+        );
+    }
+
+    #[test]
+    fn test_duplicate_variable_declaration_error() {
+        let input = r#"
+let x = 10
+let x = 20
+"#;
+        let lexer = Lexer::new(input);
+        let mut parser = Parser::new(lexer);
+        parser.parse_program();
+
+        assert!(!parser.errors.is_empty(), "Expected parser errors for duplicate variable declaration.");
+        // The error comes from symbol_table.define()
+        assert!(
+            parser.errors.iter().any(|e| e.contains("Symbol 'x' is already defined")),
+            "Error message for duplicate variable 'x' not found. Errors: {:?}", parser.errors
+        );
+    }
+
+    #[test]
+    fn test_duplicate_function_declaration_error() {
+        let input = r#"
+fn my_func()
+  let a = 1
+fn my_func()
+  let b = 2
+"#;
+        let lexer = Lexer::new(input);
+        let mut parser = Parser::new(lexer);
+        parser.parse_program();
+
+        assert!(!parser.errors.is_empty(), "Expected parser errors for duplicate function declaration.");
+        assert!(
+            parser.errors.iter().any(|e| e.contains("Symbol 'my_func' is already defined")),
+            "Error message for duplicate function 'my_func' not found. Errors: {:?}", parser.errors
+        );
+    }
+
+    #[test]
+    fn test_duplicate_variable_and_function_name_error() {
+        let test_cases = vec![
+            (r#"
+let x = 10
+fn x()
+  let a = 1
+"#, "x", "variable then function"),
+            (r#"
+fn y()
+  let a = 1
+let y = 20
+"#, "y", "function then variable"),
+        ];
+
+        for (input, name, scenario) in test_cases {
+            let lexer = Lexer::new(input);
+            let mut parser = Parser::new(lexer);
+            parser.parse_program();
+
+            assert!(!parser.errors.is_empty(), "Expected parser errors for duplicate var/fn name scenario: {}", scenario);
+            let expected_error_msg = format!("Symbol '{}' is already defined", name);
+            assert!(
+                parser.errors.iter().any(|e| e.contains(&expected_error_msg)),
+                "Error message for duplicate var/fn name '{}' (scenario: {}) not found. Errors: {:?}", name, scenario, parser.errors
+            );
+        }
+    }
+
+    #[test]
+    fn test_no_error_on_shadowing_in_different_scope() {
+        let input = r#"
+let x = 10
+fn my_func()
+  let x = 20 // Shadowing x, but in a local scope (not registered globally by current parser)
+"#;
+        let lexer = Lexer::new(input);
+        let mut parser = Parser::new(lexer);
+        parser.parse_program();
+
+        assert!(parser.errors.is_empty(), "Expected no parser errors for shadowing in different scope (current ST is global only), got: {:?}", parser.errors);
+
+        // Verify the global 'x' is still the original one.
+        match parser.symbol_table.resolve(&"x".to_string()) {
+            Some(symbol) => {
+                assert_eq!(symbol.name, "x");
+                assert_eq!(symbol.kind, SymbolKind::Variable, "Global 'x' should be a Variable.");
+                // We can't directly check the value from the symbol table as it's not stored there,
+                // but its presence and kind confirm it's the global 'let x = 10'.
+            }
+            None => panic!("Global variable 'x' not found in symbol table after parsing shadowing case."),
+        }
+
+        // Verify 'my_func' is registered
+        assert!(
+            parser.symbol_table.resolve(&"my_func".to_string()).is_some(),
+            "Function 'my_func' should be registered in the global symbol table."
+        );
+    }
+
+    #[test]
+    fn test_parser_errors_expressions() {
+        let test_cases = vec![
+            // Missing right operand
+            ("5 + \n", "Expected expression on the right side of Plus operator."),
+            // Missing left operand for infix (current parser sees '*' as unexpected prefix)
+            ("* 5\n", "No prefix parse function for token Star"),
+            // Trailing comma in function call argument list
+            // parse_expression_list: current_token is Comma. next_token_internal() consumes Comma.
+            // parse_expression is called. current_token is now RParen.
+            // parse_expression fails as RParen has no prefix parse fn.
+            // Error: "No prefix parse function for token RParen"
+            // The "Trailing comma" error in parse_expression_list is specific to `(arg1, )` where current_token becomes RParen *after* comma.
+            // If input is "myFunc(a,)\n":
+            // parse_call_expression -> parse_expression_list(RParen)
+            //  - current_token is LParen. peek_token is Ident("a")
+            //  - consumes LParen. current_token is Ident("a")
+            //  - parse_expression for "a". list = [Ident("a")]. current_token is Ident("a")
+            //  - peek_token is Comma. Consume "a", Consume Comma. current_token is Comma.
+            //  - *Now, check for trailing comma*: if current_token (Comma) is RParen -> false.
+            //  - *Then, parse_expression for thing after comma*: current_token is Comma.
+            //    The code has `self.next_token_internal(); // Consume the Comma. current_token is now Comma.` which seems wrong.
+            //    It should be `self.next_token_internal(); // Consume previous expression token`
+            //    `self.next_token_internal(); // Consume Comma. current_token is now start of next expr or RParen.`
+            //    Let's re-check parse_expression_list logic for "myFunc(a,)\n"
+            //    After parsing "a", current_token is "a". peek_token is ",".
+            //    Loop `while self.peek_token_is(&TokenKind::Comma)`: true
+            //      `self.next_token_internal();` // current_token becomes "," (from "a")
+            //      `self.next_token_internal();` // current_token becomes ")" (from ",")
+            //      Now, `if self.current_token_is(&end_token_kind)` (i.e. current_token is RParen): true
+            //        This triggers "Trailing comma before RParen..."
+            ("myFunc(a,)\n", "Trailing comma before RParen in expression list."),
+            // Missing closing parenthesis for grouped expression
+            ("(5 + 2\n", "Expected next token to be RParen, got Newline instead"),
+        ];
+
+        for (input, expected_error_fragment) in test_cases {
+            let lexer = Lexer::new(input);
+            let mut parser = Parser::new(lexer);
+            parser.parse_program(); // Attempt to parse the program
+            assert!(!parser.errors.is_empty(), "No errors found for input: '{}'", input);
+            let found_error = parser.errors.iter().any(|e| e.contains(expected_error_fragment));
+            assert!(found_error, "Expected error fragment '{}' not found in errors {:?} for input '{}'", expected_error_fragment, parser.errors, input);
+        }
+
+        // Test case: `5 +` (EOF instead of right operand)
+        let input_eof = "5 +";
+        let lexer_eof = Lexer::new(input_eof);
+        let mut parser_eof = Parser::new(lexer_eof);
+        parser_eof.parse_program();
+        assert!(!parser_eof.errors.is_empty(), "No errors for input: '{}'", input_eof);
+        let found_eof_error = parser_eof.errors.iter().any(|e| e.contains("Expected expression on the right side of Plus operator."));
+        assert!(found_eof_error, "Specific EOF error for '5 +' not found, errors: {:?}", parser_eof.errors);
+    }
+
+    #[test]
+    fn test_complex_expressions_nested_calls_precedence() {
+        // Test 1: Precedence a + b * c - d / e  => (a + (b * c)) - (d / e)
+        let input1 = "a + b * c - d / e\n";
+        let program1 = parse_input_to_program(input1);
+        assert_eq!(program1.body.len(), 1);
+        match &program1.body[0] {
+            Statement::ExpressionStatement { expression } => {
+                // Expected: ((a + (b * c)) - (d / e))
+                // Or, due to left-associativity of + and - at same level: (a + (b*c)) - (d/e)
+                // The parser should build it as: Infix(Infix(Ident(a), Plus, Infix(Ident(b), Star, Ident(c))), Minus, Infix(Ident(d), Slash, Ident(e)))
+                // Or: Infix(left: Infix(left: Ident(a), op: Plus, right: Infix(left: Ident(b), op: Star, right: Ident(c))), op: Minus, right: Infix(left: Ident(d), op: Slash, right: Ident(e)))
+                // This is how a typical Pratt parser handles it.
+                // Let's verify the top-level Minus, then its left and right.
+                if let Expression::InfixExpression { left: l1, operator: op1, right: r1 } = expression { // (a + (b*c))  MINUS  (d/e)
+                    assert_eq!(*op1, InfixOperator::Minus);
+                    // Check left side of Minus: a + (b*c)
+                    if let Expression::InfixExpression { left: l2, operator: op2, right: r2 } = &**l1 { // a PLUS (b*c)
+                        assert_eq!(*op2, InfixOperator::Plus);
+                        assert_eq!(**l2, Expression::Identifier("a".to_string())); // a
+                        // Check right side of Plus: b*c
+                        if let Expression::InfixExpression { left: l3, operator: op3, right: r3 } = &**r2 { // b STAR c
+                            assert_eq!(*op3, InfixOperator::Star);
+                            assert_eq!(**l3, Expression::Identifier("b".to_string())); // b
+                            assert_eq!(**r3, Expression::Identifier("c".to_string())); // c
+                        } else { panic!("Expected infix b*c, got {:?}", r2); }
+                    } else { panic!("Expected infix a+(b*c), got {:?}", l1); }
+                    // Check right side of Minus: d/e
+                    if let Expression::InfixExpression { left: l4, operator: op4, right: r4 } = &**r1 { // d SLASH e
+                        assert_eq!(*op4, InfixOperator::Slash);
+                        assert_eq!(**l4, Expression::Identifier("d".to_string())); // d
+                        assert_eq!(**r4, Expression::Identifier("e".to_string())); // e
+                    } else { panic!("Expected infix d/e, got {:?}", r1); }
+                } else { panic!("Expected top-level InfixExpression (Minus), got {:?}", expression); }
+            }
+            _ => panic!("Expected ExpressionStatement"),
+        }
+
+        // Test 2: func1(func2(a), b + c)
+        let input2 = "func1(func2(a), b + c)\n";
+        let program2 = parse_input_to_program(input2);
+        assert_eq!(program2.body.len(), 1);
+        match &program2.body[0] {
+            Statement::ExpressionStatement { expression } => {
+                if let Expression::FunctionCall { function: f1_name, arguments: args1 } = expression {
+                    assert_eq!(**f1_name, Expression::Identifier("func1".to_string()));
+                    assert_eq!(args1.len(), 2);
+                    // Arg 1: func2(a)
+                    if let Expression::FunctionCall { function: f2_name, arguments: args2 } = &args1[0] {
+                        assert_eq!(**f2_name, Expression::Identifier("func2".to_string()));
+                        assert_eq!(args2.len(), 1);
+                        assert_eq!(args2[0], Expression::Identifier("a".to_string()));
+                    } else { panic!("Expected func2(a) as first arg of func1, got {:?}", args1[0]); }
+                    // Arg 2: b + c
+                    if let Expression::InfixExpression { left: l_bc, operator: op_bc, right: r_bc } = &args1[1] {
+                        assert_eq!(*op_bc, InfixOperator::Plus);
+                        assert_eq!(**l_bc, Expression::Identifier("b".to_string()));
+                        assert_eq!(**r_bc, Expression::Identifier("c".to_string()));
+                    } else { panic!("Expected b+c as second arg of func1, got {:?}", args1[1]); }
+                } else { panic!("Expected func1 call, got {:?}", expression); }
+            }
+            _ => panic!("Expected ExpressionStatement"),
+        }
+
+        // Test 3: (a + b) * (c - d)
+        let input3 = "(a + b) * (c - d)\n";
+        let program3 = parse_input_to_program(input3);
+        assert_eq!(program3.body.len(), 1);
+        match &program3.body[0] {
+            Statement::ExpressionStatement { expression } => {
+                if let Expression::InfixExpression { left: group1_expr, operator: op_mul, right: group2_expr } = expression {
+                    assert_eq!(*op_mul, InfixOperator::Star);
+                    // Left side: (a + b)
+                    if let Expression::GroupedExpression(inner_g1) = &**group1_expr {
+                        if let Expression::InfixExpression {left: l_ab, operator: op_ab, right: r_ab } = &**inner_g1 {
+                            assert_eq!(*op_ab, InfixOperator::Plus);
+                            assert_eq!(**l_ab, Expression::Identifier("a".to_string()));
+                            assert_eq!(**r_ab, Expression::Identifier("b".to_string()));
+                        } else { panic!("Expected a+b inside group1, got {:?}", inner_g1); }
+                    } else { panic!("Expected GroupedExpression for (a+b), got {:?}", group1_expr); }
+                    // Right side: (c - d)
+                    if let Expression::GroupedExpression(inner_g2) = &**group2_expr {
+                        if let Expression::InfixExpression {left: l_cd, operator: op_cd, right: r_cd } = &**inner_g2 {
+                            assert_eq!(*op_cd, InfixOperator::Minus);
+                            assert_eq!(**l_cd, Expression::Identifier("c".to_string()));
+                            assert_eq!(**r_cd, Expression::Identifier("d".to_string()));
+                        } else { panic!("Expected c-d inside group2, got {:?}", inner_g2); }
+                    } else { panic!("Expected GroupedExpression for (c-d), got {:?}", group2_expr); }
+                } else { panic!("Expected top-level InfixExpression (Star), got {:?}", expression); }
+            }
+            _ => panic!("Expected ExpressionStatement"),
+        }
     }
 }

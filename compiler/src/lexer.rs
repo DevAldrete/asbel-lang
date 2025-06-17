@@ -351,18 +351,24 @@ impl Token {
 mod tests {
     use super::{Lexer, TokenKind, Token}; // Added Token for more detailed asserts if needed
 
-    // Helper to collect all TokenKinds from the lexer
-    fn get_all_token_kinds(input: &str) -> Vec<TokenKind> {
+    // Helper to collect all Tokens from the lexer
+    fn get_all_tokens(input: &str) -> Vec<Token> {
         let mut lexer = Lexer::new(input);
         let mut tokens = Vec::new();
         loop {
             let token = lexer.next_token();
-            tokens.push(token.kind.clone()); // Clone kind before token is dropped or its kind is Eof
-            if token.kind == TokenKind::Eof {
+            let is_eof = token.kind == TokenKind::Eof;
+            tokens.push(token);
+            if is_eof {
                 break;
             }
         }
         tokens
+    }
+
+    // Helper to collect all TokenKinds from the lexer
+    fn get_all_token_kinds(input: &str) -> Vec<TokenKind> {
+        get_all_tokens(input).into_iter().map(|t| t.kind).collect()
     }
 
     // Simplified helper for basic kind checking
@@ -670,6 +676,392 @@ mod tests {
         // Current lexer: start_of_line=true. Skips spaces. Sees newline. Emits newline. Repeats.
         // Then EOF. No indents/dedents if only spaces/newlines.
         assert_tokens("\n  \n\n", vec![TokenKind::Newline, TokenKind::Newline, TokenKind::Newline, TokenKind::Eof]);
+    }
+
+    #[test]
+    fn test_indent_dedent_with_comments_and_blank_lines() {
+        let input = r#"
+fn main()
+  // comment
+  let x = 1
+
+  // another comment
+  let y = 2
+let z = 3
+"#;
+        // Expected:
+        // NL (from initial blank line of raw string literal)
+        // FN Ident LP RP NL
+        // INDENT Comment NL (comment does not affect indent level itself, but is tokenized)
+        //        Ident EQ Num NL (still at indent level 1)
+        // NL (blank line, does not affect indent level)
+        //        Comment NL (still at indent level 1)
+        //        Ident EQ Num NL (still at indent level 1)
+        // DEDENT Ident EQ Num EOF
+
+        // Current lexer behavior with comments and blank lines in indentation:
+        // - A comment line or a blank line itself does not generate Indent/Dedent.
+        // - It emits Comment + Newline or just Newline.
+        // - The indentation is checked on the *next* line that contains non-whitespace characters.
+        // So, the INDENT for `let x = 1` happens after the `// comment` and its newline.
+        // The DEDENT for `let z = 3` happens before `let z`.
+
+        // Trace:
+        // "" -> Start of line, current_char is \n (from raw string literal start) -> Newline
+        // "fn main()\n" -> Fn, Ident("main"), LParen, RParen, Newline. Stack: [0]
+        // "  // comment\n" -> start_of_line=true. Sees 2 spaces. current_char is '/'.
+        //                  -> Indentation logic: current_indent=2. last_indent=0.
+        //                  -> Indent token. Stack: [0, 2].
+        //                  -> Then processes comment: Comment(" comment"), Newline.
+        // "  let x = 1\n" -> start_of_line=true. Sees 2 spaces. current_char is 'l'.
+        //                  -> Indentation logic: current_indent=2. last_indent=2 (stack top). No change.
+        //                  -> Let, Ident("x"), Eq, Integer(1), Newline.
+        // "\n"           -> start_of_line=true. current_char is '\n'.
+        //                  -> Indentation logic: blank line. No change. Emits Newline.
+        // "  // another comment\n" -> start_of_line=true. Sees 2 spaces. current_char is '/'.
+        //                  -> Indentation logic: current_indent=2. last_indent=2. No change.
+        //                  -> Comment(" another comment"), Newline.
+        // "  let y = 2\n" -> start_of_line=true. Sees 2 spaces. current_char is 'l'.
+        //                  -> Indentation logic: current_indent=2. last_indent=2. No change.
+        //                  -> Let, Ident("y"), Eq, Integer(2), Newline.
+        // "let z = 3\n" -> start_of_line=true. Sees 0 spaces. current_char is 'l'.
+        //                  -> Indentation logic: current_indent=0. last_indent=2.
+        //                  -> Dedent token. Stack: [0].
+        //                  -> Let, Ident("z"), Eq, Integer(3), Newline.
+        // EOF            -> Dedent stack to 0 if needed (already [0]). Eof.
+
+        assert_tokens(
+            input,
+            vec![
+                TokenKind::Newline, // From the initial newline in the raw string literal
+                TokenKind::Fn, TokenKind::Ident("main".to_string()), TokenKind::LParen, TokenKind::RParen, TokenKind::Newline,
+                TokenKind::Indent, // For the line with "// comment" which leads to "let x = 1"
+                TokenKind::Comment(" comment".to_string()), TokenKind::Newline,
+                // No new Indent here, already indented for "let x = 1"
+                TokenKind::Let, TokenKind::Ident("x".to_string()), TokenKind::Eq, TokenKind::Integer(1), TokenKind::Newline,
+                TokenKind::Newline, // Blank line
+                // No new Indent here for "// another comment"
+                TokenKind::Comment(" another comment".to_string()), TokenKind::Newline,
+                // No new Indent here for "let y = 2"
+                TokenKind::Let, TokenKind::Ident("y".to_string()), TokenKind::Eq, TokenKind::Integer(2), TokenKind::Newline,
+                TokenKind::Dedent, // Before "let z = 3"
+                TokenKind::Let, TokenKind::Ident("z".to_string()), TokenKind::Eq, TokenKind::Integer(3), TokenKind::Newline,
+                TokenKind::Eof,
+            ],
+        );
+    }
+
+    #[test]
+    fn test_inconsistent_indentation_errors() {
+        // 1. Tab used for indentation
+        let input_tab = "fn main()\n\tlet x = 1"; // Tab at start of line 2, col 1
+        let tokens_tab = get_all_tokens(input_tab);
+        // Expected: Fn, Ident("main"), LParen, RParen, Newline, Unknown('\t'), Let, Ident("x"), Eq, Integer(1), Dedent (if any indent happened), Eof
+        // Let's trace the tab error:
+        // Line 1: fn main() -> Fn, Ident, LParen, RParen, Newline. Stack: [0]. Line: 1
+        // Line 2: \tlet x = 1
+        //   start_of_line = true.
+        //   current_indent loop: sees `\t`.
+        //   `err_char = '\t'`. `advance()` consumes `\t`. `self.col` becomes 1 (or 2 if advance increments before read).
+        //   Lexer's advance: `self.current_char = self.input.next(); if self.current_char.is_some() { self.col += 1; }`
+        //   If current char was `\t`, col was 1. `advance()` makes `current_char = 'l'`, then `col` becomes 2.
+        //   So, the Unknown token for `\t` should be at `self.line` (2), `self.col - 1` (which is 2 - 1 = 1).
+        //   Token::new(TokenKind::Unknown('\t'), "\t", 2, 1)
+        //   The rest of the line "let x = 1" is then processed.
+        //   No Indent token was emitted. Stack is still [0].
+        //   Then let, x, =, 1.
+        //   EOF: No dedent needed as stack is [0].
+
+        assert_eq!(tokens_tab.len(), 8, "Tab input: {:?}", tokens_tab);
+        assert_eq!(tokens_tab[0].kind, TokenKind::Fn);
+        assert_eq!(tokens_tab[1].kind, TokenKind::Ident("main".to_string()));
+        assert_eq!(tokens_tab[2].kind, TokenKind::LParen);
+        assert_eq!(tokens_tab[3].kind, TokenKind::RParen);
+        assert_eq!(tokens_tab[4].kind, TokenKind::Newline);
+        assert_eq!(tokens_tab[4].line, 1, "Newline line number for tab test");
+
+        assert_eq!(tokens_tab[5].kind, TokenKind::Unknown('\t'));
+        assert_eq!(tokens_tab[5].text, "\t");
+        assert_eq!(tokens_tab[5].line, 2, "Tab Unknown token line number");
+        assert_eq!(tokens_tab[5].col, 1, "Tab Unknown token column");
+        // The 'let' token will follow. Its column will depend on how `col` is managed post-error.
+        // After returning Unknown token for tab, `next_token` is called again.
+        // `self.start_of_line` is now false. `skip_whitespace_no_newline()` runs.
+        // `current_char` is 'l'. `self.col` is 2.
+        // So 'let' token starts at col 2.
+
+        assert_eq!(tokens_tab[6].kind, TokenKind::Let); // This should be the next token
+                                                        // The problem is that after the error token, the lexer continues on the same line.
+                                                        // Let's check the full sequence for tab.
+        let expected_kinds_tab = vec![
+            TokenKind::Fn, TokenKind::Ident("main".to_string()), TokenKind::LParen, TokenKind::RParen, TokenKind::Newline,
+            TokenKind::Unknown('\t'), // Error for tab
+            TokenKind::Let, TokenKind::Ident("x".to_string()), TokenKind::Eq, TokenKind::Integer(1), // Continues parsing after error
+            TokenKind::Eof,
+        ];
+        let actual_kinds_tab = get_all_token_kinds(input_tab);
+        assert_eq!(actual_kinds_tab, expected_kinds_tab, "Token kinds for tab input do not match");
+
+
+        // 2. Dedent to a level not previously indented ("DedentError")
+        // Example: Indent to 4, then try to dedent to 2 (which was never an indent level)
+        let input_dedent_error = "fn main()\n    let x = 1\n  let y = 2";
+        // Line 1: Fn, Ident, LP, RP, NL. Stack: [0]
+        // Line 2: Indent (to 4). Let, Ident, Eq, Int, NL. Stack: [0, 4]. col for Indent is 1. line is 2.
+        // Line 3: current_indent = 2. last_indent = 4.
+        //   `while 4 > 2` is true. Pop. Stack `[0]`.
+        //   `!self.indentation_stack.contains(&2)` (`![0].contains(&2)`) is true.
+        //   Returns `Token::new(TokenKind::Unknown(' '), "DedentError", self.line (3), 1)`.
+        //   After this error, processing continues. `start_of_line` is false.
+        //   `let y = 2` is processed.
+        let tokens_dedent_error = get_all_tokens(input_dedent_error);
+        // Expected: Fn, Main, ( , ), NL, Indent, Let, x, =, 1, NL, Unknown("DedentError"), Let, y, =, 2, Eof
+        // Let's check the Unknown token specifically.
+        let error_token_dedent = tokens_dedent_error.iter().find(|t| t.text == "DedentError").expect("DedentError token not found");
+        assert_eq!(error_token_dedent.kind, TokenKind::Unknown(' '));
+        assert_eq!(error_token_dedent.line, 3, "DedentError line number");
+        assert_eq!(error_token_dedent.col, 1, "DedentError column");
+
+        let expected_kinds_dedent_error = vec![
+            TokenKind::Fn, TokenKind::Ident("main".to_string()), TokenKind::LParen, TokenKind::RParen, TokenKind::Newline,
+            TokenKind::Indent,
+            TokenKind::Let, TokenKind::Ident("x".to_string()), TokenKind::Eq, TokenKind::Integer(1), TokenKind::Newline,
+            TokenKind::Unknown(' '), // DedentError
+            TokenKind::Let, TokenKind::Ident("y".to_string()), TokenKind::Eq, TokenKind::Integer(2),
+            TokenKind::Dedent, // This dedent is to bring stack [0,4] to [0] to match final 0-indent line if y was also 0-indent
+                               // However, the error happens on line 3. Stack was [0,4]. Error happens.
+                               // Then "let y = 2" is parsed at column 3 (after "  ").
+                               // Is there an implicit dedent to 0 at EOF if stack is not [0]? Yes.
+                               // After DedentError, stack is [0]. So no dedent at EOF.
+
+            TokenKind::Eof,
+        ];
+        let actual_kinds_dedent_error = get_all_token_kinds(input_dedent_error);
+        assert_eq!(actual_kinds_dedent_error, expected_kinds_dedent_error, "Token kinds for DedentError input do not match");
+
+        // 3. "Invalid Dedent Level" - This one is tricky, might be hard to hit.
+        //    It requires `current_indent < last_indent` initially.
+        //    And after the (single effective) pop, `*self.indentation_stack.last().unwrap_or(&0)` must be `< current_indent`.
+        //    This means `new_stack_top < current_indent < old_stack_top`.
+        //    Example: stack `[0, 8]`. `current_indent = 4`. `old_stack_top = 8`.
+        //    - `current_indent (4) < old_stack_top (8)`.
+        //    - Pop `8`. Stack is `[0]`. `new_stack_top = 0`.
+        //    - `!self.indentation_stack.contains(&4)` (`![0].contains(&4)`) is true. Returns `DedentError`.
+        //    This indicates "DedentError" is likely to always be hit before "Invalid Dedent Level" if
+        //    `current_indent` is not on the stack after a pop.
+        //
+        //    The "Invalid Dedent Level" is after the while loop: `if *self.indentation_stack.last().unwrap_or(&0) != current_indent`.
+        //    This line is reachable if the `while` loop condition (`*self.indentation_stack.last().unwrap_or(&0) > current_indent`)
+        //    is false. This means `*self.indentation_stack.last().unwrap_or(&0) <= current_indent`.
+        //    So, for the error to trigger, we need `*self.indentation_stack.last().unwrap_or(&0) < current_indent`.
+        //    And this is within the block `current_indent < last_indent`.
+        //    So: `stack_top_after_pops < current_indent < last_indent_before_pops`.
+        //    And the `while` loop did not run, or ran and exited.
+        //    Given current logic (return after one dedent or DedentError), the while loop doesn't complete multiple pops.
+        //    If the `while` loop condition `*self.indentation_stack.last().unwrap_or(&0) > current_indent` is initially false,
+        //    it means `last_indent <= current_indent`.
+        //    But this code path is in `else if current_indent < last_indent`. Contradiction.
+        //    So, the `while` loop must execute at least once (pop happens).
+        //    After the pop, if `DedentError` is not returned, a `Dedent` token is returned.
+        //    This means the `Invalid Dedent Level` check is currently unreachable.
+        //    I will skip testing "Invalid Dedent Level" for now as it seems unreachable.
+    }
+
+    #[test]
+    fn test_numeric_literals_with_underscores() {
+        // Test valid underscores
+        let input1 = "1_000_000";
+        let tokens1 = get_all_tokens(input1);
+        assert_eq!(tokens1.len(), 2);
+        assert_eq!(tokens1[0].kind, TokenKind::Integer(1000000));
+        assert_eq!(tokens1[0].text, "1_000_000");
+        assert_eq!(tokens1[0].line, 1);
+        assert_eq!(tokens1[0].col, 1);
+
+        let input2 = "12_34";
+        let tokens2 = get_all_tokens(input2);
+        assert_eq!(tokens2.len(), 2);
+        assert_eq!(tokens2[0].kind, TokenKind::Integer(1234));
+        assert_eq!(tokens2[0].text, "12_34");
+
+        // Test multiple underscores together
+        let input3 = "1__000";
+        let tokens3 = get_all_tokens(input3);
+        assert_eq!(tokens3.len(), 2);
+        assert_eq!(tokens3[0].kind, TokenKind::Integer(1000));
+        assert_eq!(tokens3[0].text, "1__000");
+
+        // Test trailing underscore (allowed by current lexer logic, part of text)
+        let input4 = "123_";
+        let tokens4 = get_all_tokens(input4);
+        assert_eq!(tokens4.len(), 2);
+        assert_eq!(tokens4[0].kind, TokenKind::Integer(123));
+        assert_eq!(tokens4[0].text, "123_");
+
+        // Test leading underscore: "_123"
+        // This will be tokenized as an identifier by the current lexer, not an integer.
+        // The `_ if char.is_alphabetic() || char == '_'` branch for identifiers will take it.
+        let input_leading_underscore = "_123";
+        let tokens_leading_underscore = get_all_tokens(input_leading_underscore);
+        assert_eq!(tokens_leading_underscore.len(), 2);
+        assert_eq!(tokens_leading_underscore[0].kind, TokenKind::Ident("_123".to_string()));
+        assert_eq!(tokens_leading_underscore[0].text, "_123");
+
+        // Test number followed by underscore and then non_numeric/non_underscore char (e.g. letter)
+        // e.g. "1_a" -> Integer(1), text("1_"), Ident("a")
+        let input_num_underscore_alpha = "1_a";
+        let tokens_nua = get_all_tokens(input_num_underscore_alpha);
+        assert_eq!(tokens_nua.len(), 3);
+        assert_eq!(tokens_nua[0].kind, TokenKind::Integer(1));
+        assert_eq!(tokens_nua[0].text, "1_");
+        assert_eq!(tokens_nua[1].kind, TokenKind::Ident("a".to_string()));
+        assert_eq!(tokens_nua[1].text, "a");
+
+
+        // Test only underscores (not a number, should be an identifier)
+        // "___" -> Ident("___")
+        let input_only_underscores = "___";
+        let tokens_ou = get_all_tokens(input_only_underscores);
+        assert_eq!(tokens_ou.len(), 2);
+        assert_eq!(tokens_ou[0].kind, TokenKind::Ident("___".to_string()));
+        assert_eq!(tokens_ou[0].text, "___");
+
+        // Test case from description: `_123` (if allowed, current lexer might treat `_` at start as ident) -> Handled above
+        // Test case from description: `123_` (if allowed) -> Handled above
+
+        // Test a mix: "1_2_3 45_6_7"
+        let input_mix = "1_2_3 45_6_7";
+        let tokens_mix = get_all_tokens(input_mix);
+        assert_eq!(tokens_mix.len(), 3);
+        assert_eq!(tokens_mix[0].kind, TokenKind::Integer(123));
+        assert_eq!(tokens_mix[0].text, "1_2_3");
+        assert_eq!(tokens_mix[1].kind, TokenKind::Integer(4567));
+        assert_eq!(tokens_mix[1].text, "45_6_7");
+        assert_eq!(tokens_mix[2].kind, TokenKind::Eof);
+    }
+
+    #[test]
+    fn test_all_operators_and_punctuation_individually() {
+        // Test each operator and punctuation in a slightly more involved context
+        let input = "let res = (val1 + val2) * val3 / val4 - val5 : some_type, other // comment";
+        // Expected tokens:
+        // Let, Ident("res"), Eq,
+        // LParen, Ident("val1"), Plus, Ident("val2"), RParen,
+        // Star, Ident("val3"), Slash, Ident("val4"), Minus, Ident("val5"),
+        // Colon, Ident("some_type"), Comma, Ident("other"),
+        // Comment(" comment"), Eof
+
+        let tokens = get_all_tokens(input);
+
+        let expected_token_kinds = vec![
+            TokenKind::Let, TokenKind::Ident("res".to_string()), TokenKind::Eq,
+            TokenKind::LParen, TokenKind::Ident("val1".to_string()), TokenKind::Plus, TokenKind::Ident("val2".to_string()), TokenKind::RParen,
+            TokenKind::Star, TokenKind::Ident("val3".to_string()), TokenKind::Slash, TokenKind::Ident("val4".to_string()), TokenKind::Minus, TokenKind::Ident("val5".to_string()),
+            TokenKind::Colon, TokenKind::Ident("some_type".to_string()), TokenKind::Comma, TokenKind::Ident("other".to_string()),
+            TokenKind::Comment(" comment".to_string()),
+            TokenKind::Eof,
+        ];
+
+        let actual_token_kinds: Vec<TokenKind> = tokens.into_iter().map(|t| t.kind).collect();
+        assert_eq!(actual_token_kinds, expected_token_kinds, "Token kinds do not match for complex operator/punctuation test");
+
+        // Test them with varied spacing
+        let input_spacing = "let x = ( 5 + a ) : type_name // comment here";
+        let tokens_spacing = get_all_tokens(input_spacing);
+        let expected_kinds_spacing = vec![
+            TokenKind::Let, TokenKind::Ident("x".to_string()), TokenKind::Eq,
+            TokenKind::LParen, TokenKind::Integer(5), TokenKind::Plus, TokenKind::Ident("a".to_string()), TokenKind::RParen,
+            TokenKind::Colon, TokenKind::Ident("type_name".to_string()),
+            TokenKind::Comment(" comment here".to_string()),
+            TokenKind::Eof,
+        ];
+        let actual_kinds_spacing: Vec<TokenKind> = tokens_spacing.into_iter().map(|t| t.kind).collect();
+        assert_eq!(actual_kinds_spacing, expected_kinds_spacing, "Token kinds do not match for spacing test");
+
+
+        // Test operators and punctuation at start/end of input if meaningful (usually not without other tokens)
+        // For example, a lone "+" might be valid or not depending on language grammar, lexer should just tokenize it.
+        assert_tokens("+", vec![TokenKind::Plus, TokenKind::Eof]);
+        assert_tokens("(", vec![TokenKind::LParen, TokenKind::Eof]);
+        assert_tokens("  ,", vec![TokenKind::Comma, TokenKind::Eof]); // With leading spaces
+
+        // Test operators separated only by comments and newlines
+        let input_op_comment_nl = "+\n//comment\n-";
+        assert_tokens(input_op_comment_nl, vec![
+            TokenKind::Plus, TokenKind::Newline,
+            TokenKind::Comment("comment".to_string()), TokenKind::Newline,
+            TokenKind::Minus, TokenKind::Eof
+        ]);
+    }
+
+
+    #[test]
+    fn test_string_literals_various() {
+        // Test empty string: ""
+        let input_empty = "\"\"";
+        let tokens_empty = get_all_tokens(input_empty);
+        assert_eq!(tokens_empty.len(), 2, "Empty string input: {:?}", tokens_empty);
+        assert_eq!(tokens_empty[0].kind, TokenKind::String("".to_string()));
+        assert_eq!(tokens_empty[0].text, "\"\"");
+        assert_eq!(tokens_empty[0].line, 1);
+        assert_eq!(tokens_empty[0].col, 1);
+        assert_eq!(tokens_empty[1].kind, TokenKind::Eof);
+
+        // Test string with spaces: "  "
+        let input_spaces = "\"  \"";
+        let tokens_spaces = get_all_tokens(input_spaces);
+        assert_eq!(tokens_spaces.len(), 2, "String with spaces input: {:?}", tokens_spaces);
+        assert_eq!(tokens_spaces[0].kind, TokenKind::String("  ".to_string()));
+        assert_eq!(tokens_spaces[0].text, "\"  \"");
+        assert_eq!(tokens_spaces[0].line, 1);
+        assert_eq!(tokens_spaces[0].col, 1);
+        assert_eq!(tokens_spaces[1].kind, TokenKind::Eof);
+
+        // Test string with special characters (that don't require complex escapes): "hello (world)!"
+        let input_special = "\"hello (world)!\"";
+        let tokens_special = get_all_tokens(input_special);
+        assert_eq!(tokens_special.len(), 2, "String with special chars input: {:?}", tokens_special);
+        assert_eq!(tokens_special[0].kind, TokenKind::String("hello (world)!".to_string()));
+        assert_eq!(tokens_special[0].text, "\"hello (world)!\"");
+        assert_eq!(tokens_special[0].line, 1);
+        assert_eq!(tokens_special[0].col, 1);
+        assert_eq!(tokens_special[1].kind, TokenKind::Eof);
+
+        // Test string ending at EOF without closing quote (already covered by test_unterminated_string_literal)
+        // let input_unterminated = "\"abc";
+        // let tokens_unterminated = get_all_tokens(input_unterminated);
+        // assert_eq!(tokens_unterminated.len(), 2);
+        // assert!(matches!(tokens_unterminated[0].kind, TokenKind::Unknown('\"')));
+        // assert_eq!(tokens_unterminated[0].text, "\"abc"); // as per current Unknown token logic for unterminated string
+
+        // Test string with newline inside - current lexer behavior for unterminated string might treat this as error.
+        // Based on current `lexer.rs`:
+        // if c == '\n' { // Unterminated string at newline ... currently assumes strings are well-terminated for MVP.
+        // If string contains \n, it's part of the content.
+        // The existing unterminated string logic is if EOF is hit before ".
+        // A string like "a\nb" is valid if newlines are allowed in strings.
+        // The lexer code does:
+        // text_content.push(c); literal_text.push(c); self.advance(); if c == '\n' { /* no break */ }
+        // This means newlines are included in string content.
+        let input_newline = "\"hello\nworld\"";
+        let tokens_newline = get_all_tokens(input_newline);
+        assert_eq!(tokens_newline.len(), 2, "String with newline input: {:?}", tokens_newline);
+        assert_eq!(tokens_newline[0].kind, TokenKind::String("hello\nworld".to_string()));
+        assert_eq!(tokens_newline[0].text, "\"hello\nworld\"");
+        assert_eq!(tokens_newline[0].line, 1); // String starts on line 1
+        assert_eq!(tokens_newline[0].col, 1);
+        // The line number of the token itself is where it starts. The internal newline increments lexer's line counter.
+        assert_eq!(tokens_newline[1].kind, TokenKind::Eof);
+        // To verify lexer line/col state after this string:
+        let mut lexer_state_check = Lexer::new("\"hello\nworld\"");
+        let token1 = lexer_state_check.next_token(); // The string token
+        assert_eq!(token1.line, 1);
+        assert_eq!(token1.col, 1);
+        // After processing this token, the lexer's internal line will be 2, and col will be 7 (for 'world"').
+        // Let's check the EOF token's position.
+        let token2 = lexer_state_check.next_token(); // EOF
+        assert_eq!(token2.line, 2, "EOF line after string with newline"); // Because the string ended on line 2
+        assert_eq!(token2.col, 7, "EOF col after string with newline");  // Col after the closing quote on line 2
     }
 }
 
