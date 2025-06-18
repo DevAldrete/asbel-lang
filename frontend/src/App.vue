@@ -1,6 +1,8 @@
 <template>
   <AppLayout>
-    <router-view />
+    <router-view class="bg-red-500 prose">
+      <input type="text" class="form-input" placeholder="Test input" />
+    </router-view>
   </AppLayout>
 </template>
 
